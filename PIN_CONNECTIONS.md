@@ -1,6 +1,7 @@
 # 🔌 ESP32 Pin Connections – Smart Medicine Reminder Box
 
 
+
 This document explains the **exact pin-to-pin wiring** between the ESP32 and all sensors/modules used in the project.
 
 ---
