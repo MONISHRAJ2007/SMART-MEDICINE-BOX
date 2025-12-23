@@ -1,0 +1,261 @@
+#define BLYNK_TEMPLATE_ID "YOUR_TEMPLATE_ID "
+#define BLYNK_TEMPLATE_NAME "YOUR_TEMPLETE_NAME"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_AUTH_TOKEN"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include "RTClib.h"
+#include "time.h"
+
+// WiFi & NTP SETTINGS
+char ssid[] = "WIFI_NAME";
+char pass[] = "WIFI_PASSWORD";
+
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800; // IST = GMT +5:30
+const int daylightOffset_sec = 0;
+
+// RTC instance
+RTC_DS3231 rtc;
+
+// Pins
+#define BUZZER_PIN 27
+#define IR1_PIN 13
+#define IR2_PIN 14
+#define IR3_PIN 26
+#define IR4_PIN 25
+#define LIMIT_SWITCH_MORNING 32
+#define LIMIT_SWITCH_EVENING 33
+#define TRIG2_PIN 17
+#define ECHO2_PIN 5
+#define TRIG4_PIN 16
+#define ECHO4_PIN 4
+
+// Blynk Widgets
+WidgetTerminal terminal(V6);      // For IR status
+WidgetTerminal terminalLevel(V5); // For medicine level warnings
+
+// Variables for alarm and buzzer control
+int setHour = -1;
+int setMinute = -1;
+bool buzzerOn = false;
+bool morningAlarm = false;
+bool eveningAlarm = false;
+BlynkTimer timer;
+
+// Buzzer timing and control variables
+unsigned long alarmStartTime = 0;
+bool alarmActive = false;
+bool boxOpenedDuringAlarm = false;
+unsigned long lastRingTime = 0;
+const unsigned long ringDuration = 30000; // 1 minute
+const unsigned long ringPause = 180000;   // 3 minutes
+
+// BLYNK WRITE Handlers
+BLYNK_WRITE(V0) { setHour = param.asInt(); }
+BLYNK_WRITE(V1) { setMinute = param.asInt(); }
+
+// Helpers
+String getTimeStamp() {
+  DateTime now = rtc.now();
+  char buf[30];
+  snprintf(buf, sizeof(buf), "[%04d-%02d-%02d %02d:%02d:%02d]",
+           now.year(), now.month(), now.day(),
+           now.hour(), now.minute(), now.second());
+  return String(buf);
+}
+
+long readDistanceCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return -1;
+  return duration * 0.034 / 2;
+}
+
+void checkIRStatus() {
+  int irStates[4] = {
+    digitalRead(IR1_PIN),
+    digitalRead(IR2_PIN),
+    digitalRead(IR3_PIN),
+    digitalRead(IR4_PIN)
+  };
+  bool boxMorningOpen = (digitalRead(LIMIT_SWITCH_MORNING) == HIGH);
+  bool boxEveningOpen = (digitalRead(LIMIT_SWITCH_EVENING) == HIGH);
+
+
+  if (boxMorningOpen) {
+    String msg1 = getTimeStamp() + " Slot 1: " + (irStates[0] == LOW ? "✅ Medicine Taken" : "❌ Not Taken");
+    String msg2 = getTimeStamp() + " Slot 2: " + (irStates[1] == LOW ? "✅ Medicine Taken" : "❌ Not Taken");
+    Serial.println(msg1); terminal.println(msg1);
+    Serial.println(msg2); terminal.println(msg2);
+  }
+  if (boxEveningOpen) {
+    String msg3 = getTimeStamp() + " Slot 3: " + (irStates[2] == LOW ? "✅ Medicine Taken" : "❌ Not Taken");
+    String msg4 = getTimeStamp() + " Slot 4: " + (irStates[3] == LOW ? "✅ Medicine Taken" : "❌ Not Taken");
+    Serial.println(msg3); terminal.println(msg3);
+    Serial.println(msg4); terminal.println(msg4);
+  }
+  terminal.flush();
+}
+
+void sendUltrasonicData() {
+  bool boxMorningOpen = (digitalRead(LIMIT_SWITCH_MORNING) == HIGH);
+  bool boxEveningOpen = (digitalRead(LIMIT_SWITCH_EVENING) == HIGH);
+
+  if (!boxMorningOpen) {
+    long dist2 = readDistanceCM(TRIG2_PIN, ECHO2_PIN);
+    Blynk.virtualWrite(V30, dist2);
+    if (dist2 != -1 && dist2 > 10.5) {
+      String warning = getTimeStamp() + " ⚠ Medicine Low - Slot 2";
+      terminalLevel.println(warning);
+      terminalLevel.flush();
+      Blynk.virtualWrite(V5, warning);
+      Serial.println(warning);
+    }
+  }
+  if (!boxEveningOpen) {
+    long dist4 = readDistanceCM(TRIG4_PIN, ECHO4_PIN);
+    Blynk.virtualWrite(V31, dist4);
+    if (dist4 != -1 && dist4 > 10.5) {
+      String warning = getTimeStamp() + " ⚠ Medicine Low - Slot 4";
+      terminalLevel.println(warning);
+      terminalLevel.flush();
+      Blynk.virtualWrite(V5, warning);
+      Serial.println(warning);
+    }
+  }
+}
+
+void sendCurrentTimeToBlynk() {
+  DateTime now = rtc.now();
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+  Blynk.virtualWrite(V7, buf);
+}
+
+void checkAlarm() {
+  DateTime now = rtc.now();
+  bool boxMorningOpen = (digitalRead(LIMIT_SWITCH_MORNING) == HIGH);
+  bool boxEveningOpen = (digitalRead(LIMIT_SWITCH_EVENING) == HIGH);
+
+  if (now.hour() == setHour && now.minute() == setMinute && !alarmActive) {
+    alarmStartTime = millis();
+    alarmActive = true;
+    boxOpenedDuringAlarm = false;
+    lastRingTime = millis();
+
+    buzzerOn = true;
+    digitalWrite(BUZZER_PIN, HIGH);
+
+    morningAlarm = (now.hour() < 12);
+    eveningAlarm = !morningAlarm;
+
+    String msg = getTimeStamp() + " ⏰ Alarm triggered!";
+    Serial.println(msg);
+    terminal.println(msg);
+    terminal.flush();
+  }
+
+  if (alarmActive) {
+    if ((morningAlarm && boxMorningOpen) || (eveningAlarm && boxEveningOpen)) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerOn = false;
+      alarmActive = false;
+      boxOpenedDuringAlarm = true;
+
+      String msg = getTimeStamp() + " 🚨 Box opened, buzzer stopped";
+      Serial.println(msg);
+      terminal.println(msg);
+      terminal.flush();
+
+      checkIRStatus();
+    } else {
+      unsigned long currentMillis = millis();
+
+      if (buzzerOn && (currentMillis - alarmStartTime >= ringDuration)) {
+        digitalWrite(BUZZER_PIN, LOW);
+        buzzerOn = false;
+        lastRingTime = currentMillis;
+      }
+
+      if (!buzzerOn && !boxOpenedDuringAlarm && (currentMillis - lastRingTime >= ringPause)) {
+        buzzerOn = true;
+        digitalWrite(BUZZER_PIN, HIGH);
+        alarmStartTime = currentMillis;
+      }
+    }
+  }
+}
+
+void syncRTCWithNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Serial.println("✅ Time fetched from NTP, updating RTC...");
+    rtc.adjust(DateTime(
+      timeinfo.tm_year + 1900,
+      timeinfo.tm_mon + 1,
+      timeinfo.tm_mday,
+      timeinfo.tm_hour,
+      timeinfo.tm_min,
+      timeinfo.tm_sec));
+  } else {
+    Serial.println("⚠ Failed to get NTP time, RTC not updated");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(LIMIT_SWITCH_MORNING, INPUT_PULLDOWN);
+  pinMode(LIMIT_SWITCH_EVENING, INPUT_PULLDOWN);
+
+  pinMode(IR1_PIN, INPUT_PULLUP);
+  pinMode(IR2_PIN, INPUT_PULLUP);
+  pinMode(IR3_PIN, INPUT_PULLUP);
+  pinMode(IR4_PIN, INPUT_PULLUP);
+
+  pinMode(TRIG2_PIN, OUTPUT);
+  pinMode(ECHO2_PIN, INPUT);
+  pinMode(TRIG4_PIN, OUTPUT);
+  pinMode(ECHO4_PIN, INPUT);
+
+  if (!rtc.begin()) {
+    Serial.println("❌ RTC not found!");
+    while (1) delay(10);
+  }
+
+  WiFi.begin(ssid, pass);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi Connected");
+
+  syncRTCWithNTP();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(15000L, checkIRStatus);
+  timer.setInterval(20000L, sendUltrasonicData);
+  timer.setInterval(1000L, sendCurrentTimeToBlynk);
+  timer.setInterval(500L, checkAlarm);
+
+  terminal.println("Smart Medicine Reminder Started ✅");
+  terminal.flush();
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
